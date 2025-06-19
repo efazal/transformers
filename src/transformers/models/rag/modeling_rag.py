@@ -18,6 +18,7 @@ import copy
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -521,10 +522,28 @@ class RagModel(RagPreTrainedModel):
                     input_ids, attention_mask=attention_mask, return_dict=True
                 )
                 question_encoder_last_hidden_state = question_enc_outputs[0]  # hidden states of question encoder
+                # if hasattr(question_enc_outputs, 'pooler_output') and question_enc_outputs.pooler_output is not None:
+                #     question_encoder_last_hidden_state = question_enc_outputs.pooler_output
+                #     print("DEBUG: Using pooler_output for question_encoder_last_hidden_state.")
+                # else:
+                #     print("DEBUG: pooler_output not directly available or None. Performing mean pooling.")
+                #     # Assumes question_enc_outputs[0] is (batch_size, seq_len, hidden_dim)
+                #     question_encoder_last_hidden_state = question_enc_outputs[0].mean(dim=1)
+                print(f"DEBUG: Shape of query_vector_to_retriever passed to self.retriever: {question_encoder_last_hidden_state.shape}")
+                print(f"DEBUG: First 5 elements of query_vector_to_retriever: {question_encoder_last_hidden_state.flatten()[:5]}")
+
+                # inputs = {
+                #     "input_ids": input_ids,
+                #     "attention_mask": attention_mask,
+                #     "labels": generator_tokenizer["input_ids"]
+                # }
+                # question_encoder_last_hidden_state = self.question_encoder(**inputs).pooler_output
+                hidden_states = question_encoder_last_hidden_state.detach().to(device="cpu", dtype=torch.float32).numpy()
+                print(f"DEBUG: Norm of query_vector_to_retriever: {np.linalg.norm(hidden_states)}")
 
                 retriever_outputs = self.retriever(
                     input_ids,
-                    question_encoder_last_hidden_state.detach().to(device="cpu", dtype=torch.float32).numpy(),
+                    hidden_states,
                     prefix=self.generator.config.prefix,
                     n_docs=n_docs,
                     return_tensors="pt",
