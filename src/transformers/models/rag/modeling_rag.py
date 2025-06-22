@@ -15,6 +15,7 @@
 """RAG model implementation."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
@@ -522,26 +523,10 @@ class RagModel(RagPreTrainedModel):
                     input_ids, attention_mask=attention_mask, return_dict=True
                 )
                 question_encoder_last_hidden_state = question_enc_outputs[0]  # hidden states of question encoder
-                # if hasattr(question_enc_outputs, 'pooler_output') and question_enc_outputs.pooler_output is not None:
-                #     question_encoder_last_hidden_state = question_enc_outputs.pooler_output
-                #     print("DEBUG: Using pooler_output for question_encoder_last_hidden_state.")
-                # else:
-                #     print("DEBUG: pooler_output not directly available or None. Performing mean pooling.")
-                #     # Assumes question_enc_outputs[0] is (batch_size, seq_len, hidden_dim)
-                #     question_encoder_last_hidden_state = question_enc_outputs[0].mean(dim=1)
-                print(f"DEBUG: Shape of query_vector_to_retriever passed to self.retriever: {question_encoder_last_hidden_state.shape}")
-                print(f"DEBUG: First 5 elements of query_vector_to_retriever: {question_encoder_last_hidden_state.flatten()[:5]}")
-
-                # inputs = {
-                #     "input_ids": input_ids,
-                #     "attention_mask": attention_mask,
-                #     "labels": generator_tokenizer["input_ids"]
-                # }
-                # question_encoder_last_hidden_state = self.question_encoder(**inputs).pooler_output
+                # print(f"DEBUG(modeling_rag.py - RagModel.forward()): Shape of query_vector_to_retriever passed to self.retriever: {question_encoder_last_hidden_state.shape}")
+                # print(f"DEBUG(modeling_rag.py - RagModel.forward()): First 5 elements of query_vector_to_retriever: {question_encoder_last_hidden_state.flatten()[:5]}")
                 hidden_states = question_encoder_last_hidden_state.detach().to(device="cpu", dtype=torch.float32).numpy()
-                # hidden_states = question_encoder_last_hidden_state.detach().cpu().to(torch.float32).numpy()
-
-                print(f"DEBUG: Norm of query_vector_to_retriever: {np.linalg.norm(hidden_states)}")
+                # print(f"DEBUG(modeling_rag.py - RagModel.forward()): Norm of query_vector_to_retriever: {np.linalg.norm(hidden_states)}")
 
                 retriever_outputs = self.retriever(
                     input_ids,
@@ -973,9 +958,9 @@ class RagSequenceForGeneration(RagPreTrainedModel):
 
         if self.retriever is not None and context_input_ids is None:
             question_hidden_states = self.question_encoder(input_ids, attention_mask=attention_mask)[0]
-            print(f"DEBUG (generate): Question encoder class: {self.question_encoder.__class__}")
-            print(f"DEBUG (generate): Pre-retriever question_hidden_states shape: {question_hidden_states.shape}")
-            print(f"DEBUG (generate): Pre-retriever question_hidden_states norm: {torch.norm(question_hidden_states).item()}")
+            # print(f"DEBUG(modeling_rag.py - RagSequenceForGeneration.generate()): Question encoder class: {self.question_encoder.__class__}")
+            # print(f"DEBUG(modeling_rag.py - RagSequenceForGeneration.generate()): Pre-retriever question_hidden_states shape: {question_hidden_states.shape}")
+            # print(f"DEBUG(modeling_rag.py - RagSequenceForGeneration.generate()): Pre-retriever question_hidden_states norm: {torch.norm(question_hidden_states).item()}")
 
             context_input_ids = self.retriever(
                 input_ids,
@@ -993,16 +978,24 @@ class RagSequenceForGeneration(RagPreTrainedModel):
         model_kwargs["num_return_sequences"] = num_beams
         model_kwargs["attention_mask"] = None
 
+        print(f"DEBUG(modeling_rag.py - RagSequenceForGeneration.generate()): Post-retriever input_ids shape: {input_ids.shape}")
+        print(f"DEBUG(modeling_rag.py - RagSequenceForGeneration.generate()): Post-retriever context_input_ids shape: {context_input_ids.shape}")
         batch_size = input_ids.shape[0] if input_ids is not None else context_input_ids.shape[0] // n_docs
+        print(f"DEBUG(modeling_rag.py - RagSequenceForGeneration.generate()): Post-retriever Batch size: {batch_size}")
 
         for index in range(batch_size):
             # first, generate beams from documents:
             generator_input_ids = context_input_ids[index * n_docs : (index + 1) * n_docs]  # (n_docs, max_len)
-
+            print(f"GENERATOR INPUT AFTER: {self.retriever.generator_tokenizer.batch_decode(generator_input_ids, skip_special_tokens=True)}")
             output_sequences = self.generator.generate(
                 generator_input_ids,
                 **model_kwargs,
             )  # n_docs * n_beam, tgt_len
+
+            if output_sequences is None or output_sequences.shape[0] == 0:
+                print(f"No output sequences generated for batch index {index}. Skipping.")
+                continue  # Skip this batch element
+
             if do_deduplication:
                 # do_deduplication, max_output_len
                 output_sequences = torch.stack(list({str(k.tolist()): k for k in output_sequences}.values()))
@@ -1010,6 +1003,10 @@ class RagSequenceForGeneration(RagPreTrainedModel):
             num_candidates = output_sequences.shape[
                 0
             ]  # after deduplication, this number can be less than n_docs*n_beam
+
+            if num_candidates == 0:
+                print(f"No candidates remaining after deduplication for batch index {index}. Skipping.")
+                continue  # Skip this batch element
 
             # then, run model forwards to get nll scores:
             if input_ids is not None:
@@ -1035,6 +1032,10 @@ class RagSequenceForGeneration(RagPreTrainedModel):
                 individual_doc_scores = doc_scores[index : (index + 1), :]  # doc_scores.shape = [batch, n_docs]
                 individual_doc_scores = individual_doc_scores.repeat(num_candidates, 1)  # [num_candidates, n_docs]
 
+                decoded_context = self.retriever.question_encoder_tokenizer.batch_decode(individual_input_ids, skip_special_tokens=True)
+                for input_id, question in enumerate(decoded_context):
+                    print(f"QUESTION INPUTS DECODED- Input: {input_id}, Question: {question}")
+
                 outputs = self(
                     context_input_ids=individual_input_ids,
                     context_attention_mask=individual_attention_mask,
@@ -1045,8 +1046,19 @@ class RagSequenceForGeneration(RagPreTrainedModel):
 
             top_cand_inds = (-outputs["loss"]).topk(num_doc_return_sequences)[1]
 
+            print(f"DEBUG: output_sequences.shape: {output_sequences.shape}")
+            print(f"DEBUG: top_cand_inds: {top_cand_inds}")
+            print(f"DEBUG: Selected outputs shape: {output_sequences[top_cand_inds].shape}")
+            selected_outputs = output_sequences[top_cand_inds]
+            if selected_outputs.ndim == 1:
+                # Force batch dimension when a single sequence is selected
+                selected_outputs = selected_outputs.unsqueeze(0)
+            hypos.append(selected_outputs)
+
             # add hypothesis
-            hypos.append(output_sequences[top_cand_inds])
+#             hypos.append(output_sequences[top_cand_inds])
+
+        print(f"DEBUG(modeling_rag.py - RagSequenceForGeneration.generate()): Post-retriever hypos shape: {torch.stack(hypos).shape}")
 
         return self._cat_and_pad(hypos, pad_token_id=self.config.generator.pad_token_id)
 
