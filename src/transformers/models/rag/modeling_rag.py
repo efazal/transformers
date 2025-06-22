@@ -539,6 +539,8 @@ class RagModel(RagPreTrainedModel):
                 # }
                 # question_encoder_last_hidden_state = self.question_encoder(**inputs).pooler_output
                 hidden_states = question_encoder_last_hidden_state.detach().to(device="cpu", dtype=torch.float32).numpy()
+                # hidden_states = question_encoder_last_hidden_state.detach().cpu().to(torch.float32).numpy()
+
                 print(f"DEBUG: Norm of query_vector_to_retriever: {np.linalg.norm(hidden_states)}")
 
                 retriever_outputs = self.retriever(
@@ -971,6 +973,10 @@ class RagSequenceForGeneration(RagPreTrainedModel):
 
         if self.retriever is not None and context_input_ids is None:
             question_hidden_states = self.question_encoder(input_ids, attention_mask=attention_mask)[0]
+            print(f"DEBUG (generate): Question encoder class: {self.question_encoder.__class__}")
+            print(f"DEBUG (generate): Pre-retriever question_hidden_states shape: {question_hidden_states.shape}")
+            print(f"DEBUG (generate): Pre-retriever question_hidden_states norm: {torch.norm(question_hidden_states).item()}")
+
             context_input_ids = self.retriever(
                 input_ids,
                 question_hidden_states.detach().to(device="cpu", dtype=torch.float32).numpy(),
