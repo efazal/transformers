@@ -3237,6 +3237,7 @@ class Trainer:
                 self.state.best_model_checkpoint = best_checkpoint_dir
 
         if not self.args.save_only_model:
+            print(f"DEBUG: Saving optimizer and adapter weights to {output_dir}")
             # Save optimizer and scheduler
             self._save_optimizer_and_scheduler(output_dir)
             self._save_scaler(output_dir)
@@ -3316,6 +3317,7 @@ class Trainer:
             torch.save(rng_states, os.path.join(output_dir, f"rng_state_{self.args.process_index}.pth"))
 
     def _save_optimizer_and_scheduler(self, output_dir):
+        print(f"DEBUG: Saving optimizer and scheduler to {output_dir}")
         if is_torch_xla_available():
             xm.rendezvous("saving_optimizer_states")
             if self.is_fsdp_xla_v1_enabled:
@@ -3356,6 +3358,7 @@ class Trainer:
             else:
                 self.model_wrapped.save_checkpoint(output_dir)
         elif self.is_fsdp_enabled:
+            print("> DEBUG: Saving FSDP optimizer and scheduler to {output_dir}")
             # save fsdp specific ckpt for resuming from ckpt
             save_fsdp_model(
                 self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **_get_fsdp_ckpt_kwargs()
