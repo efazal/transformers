@@ -684,10 +684,27 @@ class Trainer:
                 "You should subclass `Trainer` and override the `create_optimizer_and_scheduler` method."
             )
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
+        
+        # Add JIT checkpoint callback if enabled
+        jit_callback = None
+        if hasattr(self.args, 'jit_checkpoint_on_sigterm') and self.args.jit_checkpoint_on_sigterm:
+            # Import only when needed to avoid import issues
+            try:
+                from .trainer_jit_checkpoint import JITCheckpointCallback
+                jit_callback = JITCheckpointCallback()
+                default_callbacks = default_callbacks + [jit_callback]
+            except ImportError as e:
+                logger.warning(f"JIT checkpointing requested but failed to import: {e}")
+            
         callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
         self.callback_handler = CallbackHandler(
             callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
         )
+        
+        # Set trainer reference for JIT callback after initialization
+        if jit_callback is not None:
+            jit_callback.set_trainer(self)
+
         self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
 
         # Will be set to True by `self._setup_loggers()` on first call to `self.log()`.
