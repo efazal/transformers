@@ -25,7 +25,7 @@ class JITCheckpointManager:
     def __init__(self, trainer, grace_period: float = 30.0):
         self.trainer = trainer
         self.grace_period = grace_period
-        self.sigterm_received = False
+        self.checkpoint_requested = False
         self.checkpoint_in_progress = False
         self.checkpoint_thread = None
         self.checkpoint_stream = None
@@ -44,42 +44,42 @@ class JITCheckpointManager:
             self._original_sigterm_handler = None
 
     def _sigterm_handler(self, signum, frame):
-        if self.sigterm_received:
+        if self.checkpoint_requested:
             return
 
         logger.info(f"SIGTERM received, initiating JIT checkpoint with {self.grace_period}s grace period")
-        self.sigterm_received = True
+        self.checkpoint_requested = True
 
         # In Kubernetes/PyTorchJob, ALL pods receive SIGTERM simultaneously
         # We need to handle this carefully for distributed training
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-            logger.info(f"Distributed training detected: rank={rank}, world_size={world_size}")
-            
-            if rank == 0:
-                # Master rank: Try to checkpoint immediately
-                logger.info("Master rank received SIGTERM, attempting immediate checkpoint")
-                self.checkpoint_thread = threading.Thread(
-                    target=self._kubernetes_checkpoint_strategy,
-                    daemon=True
-                )
-                self.checkpoint_thread.start()
-            else:
-                # Worker ranks: Try to stay alive a bit longer to help with checkpoint
-                logger.info(f"Worker rank {rank} received SIGTERM, will try to assist with checkpoint")
-                self.checkpoint_thread = threading.Thread(
-                    target=self._worker_assist_strategy,
-                    daemon=True
-                )
-                self.checkpoint_thread.start()
-        else:
-            # Single node training
-            self.checkpoint_thread = threading.Thread(
-                target=self._async_checkpoint_with_timeout,
-                daemon=True
-            )
-            self.checkpoint_thread.start()
+        # if torch.distributed.is_initialized():
+        #     rank = torch.distributed.get_rank()
+        #     world_size = torch.distributed.get_world_size()
+        #     logger.info(f"Distributed training detected: rank={rank}, world_size={world_size}")
+        #
+        #     if rank == 0:
+        #         # Master rank: Try to checkpoint immediately
+        #         logger.info("Master rank received SIGTERM, attempting immediate checkpoint")
+        #         self.checkpoint_thread = threading.Thread(
+        #             target=self._kubernetes_checkpoint_strategy,
+        #             daemon=True
+        #         )
+        #         self.checkpoint_thread.start()
+        #     else:
+        #         # Worker ranks: Try to stay alive a bit longer to help with checkpoint
+        #         logger.info(f"Worker rank {rank} received SIGTERM, will try to assist with checkpoint")
+        #         self.checkpoint_thread = threading.Thread(
+        #             target=self._worker_assist_strategy,
+        #             daemon=True
+        #         )
+        #         self.checkpoint_thread.start()
+        # else:
+        #     # Single node training
+        #     self.checkpoint_thread = threading.Thread(
+        #         target=self._async_checkpoint_with_timeout,
+        #         daemon=True
+        #     )
+        #     self.checkpoint_thread.start()
 
     def _kubernetes_checkpoint_strategy(self):
         """
@@ -104,25 +104,6 @@ class JITCheckpointManager:
         try:
             logger.info("Worker node assisting with checkpoint...")
 
-            # assist_time = min(10.0, self.grace_period * 0.3)  # Max 10s or 30% of grace period
-            #
-            # start_time = time.time()
-            # while time.time() - start_time < assist_time:
-            #     if torch.distributed.is_initialized():
-            #         try:
-            #             # Check if we're still needed for distributed operations
-            #             # This is a non-blocking check
-            #             if hasattr(torch.distributed, 'is_torchelastic_launched'):
-            #                 # In elastic/k8s environments, we might get status updates
-            #                 pass
-            #         except:
-            #             # Any error means distributed backend is shutting down
-            #             break
-                        
-            # time.sleep(self.trainer.args.jit_checkpoint_grace_period - 2)  # Small sleep to not busy-wait
-                
-            # logger.info("Worker node finished assisting, will stop training")
-            
         except Exception as e:
             logger.error(f"Error in worker assist strategy: {e}")
         finally:
@@ -182,14 +163,14 @@ class JITCheckpointManager:
 
         try:
             logger.info("Starting JIT checkpoint save")
-            
+
             # For distributed training, we need to be more careful about NCCL operations
             # First, ensure all processes are synchronized before starting checkpoint
             if hasattr(self.trainer, 'accelerator') and self.trainer.accelerator.num_processes > 1:
                 try:
                     # Give a shorter timeout for the initial sync
                     logger.info("Synchronizing distributed processes before JIT checkpoint")
-                    torch.distributed.barrier(timeout=timedelta(seconds=10))
+                    torch.distributed.barrier()
                 except Exception as e:
                     logger.warning(f"Failed to synchronize processes before checkpoint, continuing: {e}")
 
@@ -213,7 +194,7 @@ class JITCheckpointManager:
         try:
             original_step = self.trainer.state.global_step
             logger.info(f"Saving JIT checkpoint at step {original_step}")
-            
+
             # Call the trainer's checkpoint method directly without timeout manipulation
             self.trainer._save_checkpoint(self.trainer.model, trial=None)
 
@@ -232,8 +213,8 @@ class JITCheckpointManager:
             logger.error(f"Failed to save JIT checkpoint: {e}")
             raise
 
-    def should_stop_training(self) -> bool:
-        return self.sigterm_received
+    def should_checkpoint_now(self) -> bool:
+        return self.checkpoint_requested
 
     def cleanup(self):
         self.cleanup_signal_handler()
@@ -261,9 +242,31 @@ class JITCheckpointCallback(TrainerCallback):
             logger.info("JIT checkpointing enabled for Kubernetes/PyTorchJob environment")
 
     def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        if self.jit_manager and self.jit_manager.should_stop_training():
+        if self.jit_manager and self.jit_manager.should_checkpoint_now():
             logger.info("SIGTERM detected, triggering JIT checkpoint before optimizer step")
-            control.should_training_stop = True
+            try:
+                # Do checkpoint SYNCHRONOUSLY - don't use daemon thread
+                self.jit_manager._execute_jit_checkpoint()
+                self.jit_manager.checkpoint_requested = False  # Mark as completed
+                logger.info("JIT checkpoint completed at pre-optimizer step")
+            except Exception as e:
+                logger.error(f"Error in pre-optimizer step checkpoint: {e}")
+            finally:
+                control.should_training_stop = True
+
+    def on_step_end(self, args, state, control, **kwargs):
+        # Log
+        if self.jit_manager and self.jit_manager.should_checkpoint_now():
+            logger.info("SIGTERM detected, triggering JIT checkpoint on step end")
+            try:
+                # Do checkpoint SYNCHRONOUSLY - don't use daemon thread
+                self.jit_manager._execute_jit_checkpoint()
+                self.jit_manager.checkpoint_requested = False  # Mark as completed
+                logger.info("JIT checkpoint completed at step end")
+            except Exception as e:
+                logger.error(f"Error in step end checkpoint strategy: {e}")
+            finally:
+                control.should_training_stop = True
 
     def on_train_end(self, args, state, control, **kwargs):
         if self.jit_manager:
